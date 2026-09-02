@@ -22,6 +22,7 @@ from PyQt6.QtCore import Qt, QRectF
 from PyQt6.QtGui import QFont, QTransform
 from PyQt6.QtWidgets import QApplication
 import re
+import time
 from scipy.interpolate import interp1d, interp2d, splrep, splev
 from scipy.integrate import cumulative_trapezoid as cumtrapz
 from scipy.optimize import curve_fit, least_squares
@@ -32,6 +33,20 @@ from shapely.lib import bounds
 from ..profiles import tau, convolveflux, makegrid, add_ext
 from .external import sg_smooth as sg
 from .utils import Timer, MaskableList, moffat_func, smooth, fetch_COS_files
+from .coverage_models import combine_line_profiles, coverage_region_for_line
+
+
+def _fit_profile_for_spectrum(spectrum):
+    """Return the transient profiler dictionary for one objective evaluation."""
+    root = getattr(spectrum.parent, "_fit_profile_eval", None)
+    if root is None:
+        return None
+    try:
+        exp_index = int(spectrum.ind())
+    except Exception:
+        exp_index = -1
+    spectra = root.setdefault("spectra", {})
+    return spectra.setdefault(exp_index, {"exposure": exp_index})
 
 class Speclist(list):
     def __init__(self, parent):
@@ -139,7 +154,12 @@ class Speclist(list):
         self.redraw()
 
     def prepareFit(self, ind=-1, exp_ind=-1, all=True, selected_species=None, selected_line=None):
+        root_profile = getattr(self.parent, "_fit_profile_eval", None)
+        manager_profile = root_profile.setdefault("prepareFit_manager", {}) if root_profile is not None else None
+        stage_started = time.perf_counter() if manager_profile is not None else None
         self.parent.fit.update()
+        if manager_profile is not None:
+            manager_profile["fit_update_seconds"] = time.perf_counter() - stage_started
 
         if self.parent.fitType == 'julia':
             #self.parent.reload_julia()
@@ -147,10 +167,12 @@ class Speclist(list):
             self.parent.julia_add = self.parent.julia.prepare_add(self.parent.fit, self.parent.julia_pars)
             self.parent.julia_cos = self.parent.julia.prepare_COS(self) #, s.prepare_COS())
 
+        stage_started = time.perf_counter() if manager_profile is not None else None
         for i, s in enumerate(self):
             if exp_ind in [-1, i]:
-                print(self.parent.tau_limit)
                 s.findFitLines(ind, all=all, debug=False, tlim=self.parent.tau_limit, selected_species=selected_species, selected_line=selected_line)
+        if manager_profile is not None:
+            manager_profile["find_lines_dispatch_seconds"] = time.perf_counter() - stage_started
 
         if self.parent.fitType == 'julia':
             self.parent.julia_spec = self.parent.julia.prepare(self, self.parent.julia_pars, self.parent.julia_add, self.parent.julia_cos)
@@ -2241,14 +2263,21 @@ class Spectrum():
         return pix, lsf_wvlns, np.lib.recfunctions.structured_to_unstructured(lsf.as_array()), disp_coeff
 
     def findFitLines(self, ind=-1, tlim=0.01, all=True, debug=True, selected_species=None, selected_line=None):
-        """
-        Function to prepare lines to fit.
-          - ind         : specify component to fit
-          - all         : if all then look for all the lines located in the  normalized spectrum
+        """Prepare the absorption lines that contribute to this fit window.
 
-        Prepared lines where fit will be calculated are stored in self.fit_lines list.
+        When a coverage comparison enables detailed profiling, this routine
+        records how much time is spent discovering candidate transitions,
+        constructing their temporary ``tau`` objects/ranges, assigning LFRs,
+        and testing overlap with the fitted pixels.  The numerical behaviour
+        is unchanged when profiling is disabled.
         """
-        #debug = True
+        profile = _fit_profile_for_spectrum(self)
+        started = time.perf_counter() if profile is not None else None
+        range_seconds = 0.0
+        coverage_seconds = 0.0
+        selection_seconds = 0.0
+        candidates = 0
+        slow_ranges = []
 
         if ind == -1:
             self.fit_lines = MaskableList([])
@@ -2271,6 +2300,7 @@ class Spectrum():
                             for l in lin:
                                 if selected_line is None or l == selected_line:
                                     if str(l) not in sys.exclude:
+                                        candidates += 1
                                         l.b = sys.sp[sp].b.val
                                         l.type = sys.sp[sp].type
                                         l.logN = sys.sp[sp].N.val
@@ -2278,19 +2308,22 @@ class Spectrum():
                                         l.z = sys.z.val
                                         l.recalc = True
                                         l.sys = sys.ind
+
+                                        t0 = time.perf_counter() if profile is not None else None
                                         l.range = tau(l, resolution=self.resolution()).getrange(tlim=tlim)
-                                        l.cf = -1
-                                        if self.parent.fit.cf_fit:
-                                            for i in range(self.parent.fit.cf_num):
-                                                cf = getattr(self.parent.fit, 'cf_'+str(i))
-                                                cf_sys = cf.addinfo.split('_')[0]
-                                                if cf_sys == 'all':
-                                                    cf_sys = np.arange(len(self.parent.fit.sys))
-                                                else:
-                                                    cf_sys = [int(s) for s in cf_sys.split('sys')[1:]]
-                                                cf_exp = cf.addinfo.split('_')[1] if len(cf.addinfo.split('_')) > 1 else 'all'
-                                                if (sys.ind in cf_sys) and (cf_exp == 'all' or self.ind() == int(cf_exp[3:])) and l.l()*(1+l.z) > cf.left and l.l()*(1+l.z) < cf.right:
-                                                    l.cf = i
+                                        if profile is not None:
+                                            dt = time.perf_counter() - t0
+                                            range_seconds += dt
+                                            slow_ranges.append((dt, str(l), int(sys.ind)))
+
+                                        t0 = time.perf_counter() if profile is not None else None
+                                        region = coverage_region_for_line(
+                                            self.parent.fit, l, exposure_index=self.ind()
+                                        )
+                                        l.cf = -1 if region is None else region
+                                        if profile is not None:
+                                            coverage_seconds += time.perf_counter() - t0
+
                                         l.stack = -1
                                         if self.parent.fit.stack_num > 0:
                                             for i in range(self.parent.fit.stack_num):
@@ -2298,91 +2331,181 @@ class Spectrum():
                                                 if st.strip() == 'N_{0:d}_{1:s}'.format(l.sys, sp.strip()):
                                                     l.stack = i
 
+                                        t0 = time.perf_counter() if profile is not None else None
                                         if all:
-                                            if l.range[0] < x[-1] and l.range[1] > x[0]:
-                                            #if np.sum(l.range) / 2 < x[-1] and np.sum(l.range) / 2 > x[0]:
-                                                self.fit_lines += [l]
+                                            selected = l.range[0] < x[-1] and l.range[1] > x[0]
                                         else:
-                                            if np.sum(np.logical_and(x >= l.range[0], x <= l.range[1])) > 0:
-                                                self.fit_lines += [l]
+                                            selected = np.sum(np.logical_and(x >= l.range[0], x <= l.range[1])) > 0
+                                        if selected:
+                                            self.fit_lines += [l]
+                                        if profile is not None:
+                                            selection_seconds += time.perf_counter() - t0
+
+        if profile is not None:
+            slow_ranges.sort(key=lambda item: item[0], reverse=True)
+            profile["findFitLines"] = {
+                "total_seconds": time.perf_counter() - started,
+                "range_seconds": range_seconds,
+                "coverage_assignment_seconds": coverage_seconds,
+                "selection_seconds": selection_seconds,
+                "candidate_lines": int(candidates),
+                "selected_lines": int(len(self.fit_lines)),
+                "fitted_pixels": int(np.count_nonzero(self.fit_mask.norm.x)) if hasattr(self, 'fit_mask') else 0,
+                "slow_range_lines": [
+                    {"seconds": dt, "line": label, "system": sys_id}
+                    for dt, label, sys_id in slow_ranges[:5]
+                ],
+            }
+
         if debug:
             print('findFitLines', self.fit_lines, [l.cf for l in self.fit_lines])
 
+    def _combine_line_profiles(self, x, lines):
+        return combine_line_profiles(x, lines, self.parent.fit)
+
     def calcFit(self, ind=-1, x=None, recalc=False, redraw=True, timer=False, tau_limit=0.01):
-        """
-           calculate the absorption profile
-           - ind             : specify the exposure for which fit is calculated
-           - recalc          : if True recalculate profile in all lines (given in self.fit_lines)
-           - redraw          : if True redraw the fit
-        :return:
+        """Calculate the regular Python absorption profile.
+
+        Detailed timing is collected only while ``fitAbs`` has installed a
+        transient ``_fit_profile_eval`` dictionary on the viewer.  This keeps
+        ordinary interactive fitting behaviour unchanged while allowing the
+        comparison runner to expose the actual bottleneck.
         """
         if timer:
             t = Timer(str(ind))
 
+        profile = _fit_profile_for_spectrum(self)
+        calc_profile = profile.setdefault("calcFit", {}) if profile is not None else None
+        calc_started = time.perf_counter() if profile is not None else None
+
         if self.spec.norm.n > 0 and self.cont.n > 0:
-            # >>> update line parameters:
+            stage_started = time.perf_counter() if profile is not None else None
+            slow_tau_setup = []
+            n_tau_setup = 0
             for line in self.fit_lines:
                 if ind == -1 or ind == line.sys:
                     if line.recalc or recalc:
+                        line_started = time.perf_counter() if profile is not None else None
                         sys = self.parent.fit.sys[line.sys]
                         line.b = sys.sp[line.name.split()[0]].b.val
                         line.logN = sys.sp[line.name.split()[0]].N.val
                         line.z = sys.z.val
                         line.tau = tau(line, resolution=self.resolution())
+                        n_tau_setup += 1
+                        if profile is not None:
+                            slow_tau_setup.append((time.perf_counter() - line_started, str(line), int(line.sys)))
+            if profile is not None:
+                calc_profile["tau_setup_seconds"] = time.perf_counter() - stage_started
+                calc_profile["n_tau_setup"] = int(n_tau_setup)
+                slow_tau_setup.sort(key=lambda item: item[0], reverse=True)
+                calc_profile["slow_tau_setup_lines"] = [
+                    {"seconds": dt, "line": label, "system": sys_id}
+                    for dt, label, sys_id in slow_tau_setup[:5]
+                ]
             if timer:
                 t.time('update')
 
-            # >>> create lambda grid:
             if x is None:
                 x_spec = self.spec.norm.x
                 mask_glob = self.mask.norm.x
-                #mask_glob = np.zeros_like(x_spec)
+                stage_started = time.perf_counter() if profile is not None else None
+                slow_grid = []
                 for line in self.fit_lines:
+                    line_started = time.perf_counter() if profile is not None else None
                     mask_glob = np.maximum(mask_glob, line.tau.grid_spec(x_spec, tlim=tau_limit))
+                    if profile is not None:
+                        slow_grid.append((time.perf_counter() - line_started, str(line), int(line.sys)))
+                if profile is not None:
+                    calc_profile["grid_mask_seconds"] = time.perf_counter() - stage_started
+                    slow_grid.sort(key=lambda item: item[0], reverse=True)
+                    calc_profile["slow_grid_lines"] = [
+                        {"seconds": dt, "line": label, "system": sys_id}
+                        for dt, label, sys_id in slow_grid[:5]
+                    ]
+                stage_started = time.perf_counter() if profile is not None else None
                 x = makegrid(x_spec, mask_glob)
+                if profile is not None:
+                    calc_profile["makegrid_seconds"] = time.perf_counter() - stage_started
                 if timer:
                     t.time('create x')
+            elif profile is not None:
+                calc_profile["grid_mask_seconds"] = 0.0
+                calc_profile["makegrid_seconds"] = 0.0
 
-            # >>> calculate the intrinsic absorption line spectrum
-            flux = np.zeros_like(x)
+            active_lines = []
+            stage_started = time.perf_counter() if profile is not None else None
+            slow_profiles = []
+            n_calctau = 0
             for line in self.fit_lines:
                 if ind == -1 or ind == line.sys:
                     if line.recalc or recalc:
-                        line.profile = line.tau.calctau(x, vel=False, verbose=False, convolve=None, tlim=tau_limit)
+                        line_started = time.perf_counter() if profile is not None else None
+                        line.profile = line.tau.calctau(
+                            x, vel=False, verbose=False, convolve=None, tlim=tau_limit
+                        )
                         line.recalc = False
-                    if not self.parent.fit.cf_fit:
-                        flux += line.profile
-                    else:
-                        cf = np.min([1, np.sum([getattr(self.parent.fit, 'cf_' + str(i)).val for i in line.cf])])
-                        flux += - np.log(np.exp(-line.profile) * (1 - cf) + cf)
+                        n_calctau += 1
+                        if profile is not None:
+                            slow_profiles.append((time.perf_counter() - line_started, str(line), int(line.sys)))
+                    active_lines.append(line)
+            if profile is not None:
+                calc_profile["calctau_seconds"] = time.perf_counter() - stage_started
+                calc_profile["n_calctau"] = int(n_calctau)
+                slow_profiles.sort(key=lambda item: item[0], reverse=True)
+                calc_profile["slow_calctau_lines"] = [
+                    {"seconds": dt, "line": label, "system": sys_id}
+                    for dt, label, sys_id in slow_profiles[:5]
+                ]
 
-            flux = np.exp(-flux)
-
+            stage_started = time.perf_counter() if profile is not None else None
+            if profile is not None:
+                self.parent.fit._coverage_profile_sink = calc_profile
+            try:
+                flux = self._combine_line_profiles(x, active_lines)
+            finally:
+                if profile is not None and hasattr(self.parent.fit, '_coverage_profile_sink'):
+                    delattr(self.parent.fit, '_coverage_profile_sink')
+            if profile is not None:
+                calc_profile["coverage_seconds"] = time.perf_counter() - stage_started
             if timer:
                 t.time('calc profiles')
 
             # >>> convolve the spectrum with instrument function
-            #self.resolution = None
+            stage_started = time.perf_counter() if profile is not None else None
             if self.resolution_linear[0] not in [None, 0]:
                 flux = convolveflux(x, flux, self.resolution(), kind='direct')
+            if profile is not None:
+                calc_profile["convolution_seconds"] = time.perf_counter() - stage_started
             if timer:
                 t.time('convolve')
 
-            # >>> correct for artificial continuum:
+            stage_started = time.perf_counter() if profile is not None else None
             if self.parent.fit.cont_fit and self.parent.fit.cont_num > 0:
                 flux = flux * self.correctContinuum(x)
+            if profile is not None:
+                calc_profile["continuum_seconds"] = time.perf_counter() - stage_started
 
-            # >>> correct for dispersion:
+            stage_started = time.perf_counter() if profile is not None else None
             if self.parent.fit.disp_num > 0:
                 for i in range(self.parent.fit.disp_num):
                     if getattr(self.parent.fit, 'displ_' + str(i)).addinfo == 'exp_' + str(self.ind()):
-                        f = interp1d(x + (x - getattr(self.parent.fit, 'displ_' + str(i)).val) * getattr(self.parent.fit,'disps_' + str(i)).val + getattr(self.parent.fit,'dispz_' + str(i)).val, flux, bounds_error=False, fill_value=1)
+                        f = interp1d(
+                            x + (x - getattr(self.parent.fit, 'displ_' + str(i)).val)
+                            * getattr(self.parent.fit,'disps_' + str(i)).val
+                            + getattr(self.parent.fit,'dispz_' + str(i)).val,
+                            flux, bounds_error=False, fill_value=1
+                        )
                         flux = f(x)
+            if profile is not None:
+                calc_profile["dispersion_seconds"] = time.perf_counter() - stage_started
 
-            if (ind == -1) and self.parent.options("telluric") and len(self.sky_cont.x() > 0) :
+            stage_started = time.perf_counter() if profile is not None else None
+            if (ind == -1) and self.parent.options("telluric") and len(self.sky_cont.x() > 0):
                 flux *= self.sky_cont.inter(x)
+            if profile is not None:
+                calc_profile["telluric_seconds"] = time.perf_counter() - stage_started
 
-            # >>> set fit graphics
+            stage_started = time.perf_counter() if profile is not None else None
             if ind == -1:
                 self.set_fit(x=x, y=flux)
                 if redraw:
@@ -2390,6 +2513,16 @@ class Spectrum():
                     self.set_res()
             else:
                 self.set_fit_comp(x=x, y=flux, ind=ind)
+            if profile is not None:
+                calc_profile["set_fit_seconds"] = time.perf_counter() - stage_started
+                calc_profile["total_seconds"] = time.perf_counter() - calc_started
+                calc_profile["grid_points"] = int(np.asarray(x).size)
+                calc_profile["active_lines"] = int(len(active_lines))
+                try:
+                    resolution_value = self.resolution()
+                    calc_profile["resolution"] = float(np.asarray(resolution_value).reshape(-1)[0])
+                except Exception:
+                    calc_profile["resolution"] = None
             if timer:
                 t.time('set_fit')
 
@@ -2488,19 +2621,15 @@ class Spectrum():
             #print(len(x), num)
 
             # >>> calculate the intrinsic absorption line spectrum
-            flux = np.zeros_like(x)
+            active_lines = []
             for line in self.fit_lines:
                 if ind == -1 or ind == line.sys:
                     if line.recalc or recalc:
                         line.profile = line.tau.calctau(x, vel=False, verbose=False, convolve=None, tlim=tau_limit)
                         line.recalc = False
-                    if not self.parent.fit.cf_fit:
-                        flux += line.profile
-                    else:
-                        cf = np.min([1, np.sum([getattr(self.parent.fit, 'cf_' + str(i)).val for i in line.cf])])
-                        flux += - np.log(np.exp(-line.profile) * cf + (1 - cf))
+                    active_lines.append(line)
 
-            flux = np.exp(-flux)
+            flux = self._combine_line_profiles(x, active_lines)
 
             # >>> convolve the spectrum with instrument function
             if self.resolution_linear[0] not in [None, 0]:
@@ -2575,39 +2704,15 @@ class Spectrum():
                 t.time('create x')
 
             # >>> calculate the intrinsic absorption line spectrum
-            flux = np.zeros_like(x)
+            active_lines = []
             for line in self.fit_lines:
                 if ind == -1 or ind == line.sys:
                     if line.recalc or recalc:
                         line.profile = line.tau.calctau(x, vel=False, verbose=False, convolve=None, tlim=tau_limit)
                         line.recalc = False
-                    if not self.parent.fit.cf_fit:
-                        flux += line.profile
+                    active_lines.append(line)
 
-            # >>> include partial covering:
-            if self.parent.fit.cf_fit:
-                cfs, inds = [], []
-                for i, line in enumerate(self.fit_lines):
-                    if ind == -1 or ind == line.sys:
-                        cfs.append(line.cf)
-                        inds.append(i)
-                cfs = np.array(cfs)
-                for l in np.unique(cfs):
-                    if l > -1:
-                        cf = self.parent.fit.getValue('cf_' + str(l))
-                    else:
-                        cf = 1
-                    profile = np.zeros_like(x)
-                    for i, c in zip(inds, cfs):
-                        if c == l:
-                            profile += self.fit_lines[i].profile
-
-                    flux += - np.log(np.exp(-profile) * cf + (1 - cf))
-
-                #cf = np.min([1, np.sum([getattr(self.parent.fit, 'cf_' + str(i)).val for i in line.cf])])
-                #flux += - np.log(np.exp(-line.profile) * (1 - cf) + cf)
-
-            flux = np.exp(-flux)
+            flux = self._combine_line_profiles(x, active_lines)
 
             if (ind == -1) and self.parent.options("telluric") and len(self.sky_cont.x() > 0):
                 flux *= self.sky_cont.inter(x)

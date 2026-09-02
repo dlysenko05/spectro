@@ -10,7 +10,7 @@ from astropy import units as u
 from dust_extinction.averages import G03_SMCBar
 from dust_extinction.parameter_averages import G23
 import matplotlib.pyplot as plt
-from numba import jit
+from numba import jit, njit
 import numpy as np
 from scipy.integrate import simpson
 from scipy.interpolate import interp1d
@@ -384,7 +384,7 @@ def convolveflux(l, f, res, vel=False, kind='astropy', verbose=False, debug=Fals
 
 # jit decorator tells Numba to compile this function.
 # The argument types will be inferred by Numba when function is called.
-@jit(forceobj=True, looplift=True)
+@njit(cache=True)
 def gauss(x, s):
     return 1 / np.sqrt(2 * np.pi) / s * np.exp(-.5 * (x / s) ** 2)
 
@@ -394,7 +394,7 @@ def errf(x):
     t = 1 / (1 + 0.47047 * np.abs(x))
     return np.sign(x) * (1 - t * (a[0] + t * (a[1] + t * a[2])) * np.exp(-x**2))
 
-@jit(forceobj=True, looplift=True)
+@njit(cache=True)
 def errf_v2(x):
     a = [-1.26551223, 1.00002368, 0.37409196, 0.09678418, -0.18628806, 0.27886807, -1.13520398, 1.48851587, -0.82215223, 0.17087277]
     t = 1 / (1 + 0.5 * np.abs(x))
@@ -453,7 +453,7 @@ def convolve_res(l, f, R):
 
     return fc
 
-@jit(forceobj=True, looplift=True)
+@njit(cache=True)
 def convolve_res2(l, f, R):
     """
     Convolve flux with instrument function specified by resolution R
@@ -500,15 +500,48 @@ def convolve_res2(l, f, R):
 
     return 1 - fc
 
-#@jit
-def makegrid(x, n):
-    ind = np.argwhere(n)
-    l = x[ind]
-    for k, i in zip(range(len(ind)-2, -1, -1), reversed(ind[:-1])):
-        d = (x[i+1] - x[i]) / (int(n[i]) + 1)
-        l = np.insert(l, np.ones(int(n[i][0]), dtype=int) * (k+1), x[i] + d * (np.arange(int(n[i])) + 1))
+@njit(cache=True)
+def _makegrid_compiled(x, n):
+    """Build the historical adaptive grid without repeated ``np.insert``.
 
-    return l
+    This is numerically equivalent to the legacy implementation, but it
+    preallocates the final array and fills it in one pass.  ``n`` is often a
+    floating array because it is created with ``zeros_like(x)``; values are
+    intentionally converted with ``int`` exactly as before.
+    """
+    ind = np.nonzero(n != 0)[0]
+    m = ind.size
+    if m == 0:
+        return np.empty(0, dtype=x.dtype)
+
+    total = m
+    for j in range(m - 1):
+        total += int(n[ind[j]])
+
+    out = np.empty(total, dtype=x.dtype)
+    pos = 0
+    for j in range(m):
+        i = ind[j]
+        out[pos] = x[i]
+        pos += 1
+        if j < m - 1:
+            count = int(n[i])
+            if count > 0:
+                d = (x[i + 1] - x[i]) / (count + 1)
+                for q in range(count):
+                    out[pos] = x[i] + d * (q + 1)
+                    pos += 1
+    return out
+
+
+def makegrid(x, n):
+    """Create the adaptive wavelength grid used by the Python fitter.
+
+    The public wrapper keeps the historical API while the compiled helper
+    removes the O(N^2)-like repeated insertion cost for very extended strong
+    lines.
+    """
+    return _makegrid_compiled(np.asarray(x), np.asarray(n))
 
 def add_LyaForest(x, z_em=0, factor=1, kind='trans'):
     """

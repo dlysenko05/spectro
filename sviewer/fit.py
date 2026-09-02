@@ -6,6 +6,13 @@ from .utils import Timer
 from ..a_unc import a
 from ..atomic import abundance, doppler
 from ..pyratio import pyratio
+from .coverage_models import (
+    coverage_mode_index,
+    coverage_mode_name,
+    coverage_region_for_line,
+    format_coverage_assignment,
+    parse_coverage_assignment,
+)
 
 class par:
     def __init__(self, parent, name, val, min, max, step, addinfo='', vary=True, fit=True, show=True, left=None, right=None):
@@ -17,6 +24,10 @@ class par:
             self.dec = 3
         elif 'res' in self.name:
             self.dec = 1
+        elif self.name == 'covmode':
+            self.dec = 0
+        elif self.name.startswith('cov'):
+            self.dec = 3
         elif 'cf' in self.name:
             self.dec = 3
         elif 'zero' in self.name:
@@ -438,9 +449,97 @@ class fitPars:
         self.res_num = 0
         self.cf_fit = False
         self.cf_num = 0
+        self.covmode = par(self, 'covmode', 1, 0, 9, 1, vary=False, fit=False)
         self.disp_num = 0
         self.stack_num = 0
         self.tieds = {}
+        self._tie_saved_states = {}
+
+    def coverage_model(self):
+        return coverage_mode_name(self.covmode.val)
+
+    def set_coverage_model(self, value):
+        self.covmode.val = coverage_mode_index(value)
+        self.covmode.vary = False
+        self.covmode.fit = False
+
+    @staticmethod
+    def coverage_parameter_names(ind):
+        return [f'cova_{ind}', f'covr_{ind}', f'cov1_{ind}', f'cov2_{ind}', f'covov_{ind}']
+
+    def ensure_system_powerlaw_parameters(self):
+        """Create one x-PL exponent parameter per kinematic system.
+
+        ``covasys_i`` is intentionally distinct from legacy ``cova_i``:
+        cova_i remains attached to LFR i, while covasys_i follows sys i and
+        is shared by all wavelength regions in ``powerlaw_ppc_sysa`` mode and by all transitions in ``powerlaw_sysa_global`` mode.
+        """
+        for system_id in range(len(self.sys)):
+            name = f'covasys_{system_id}'
+            if not hasattr(self, name):
+                self.add(name)
+
+    def ensure_coverage_parameters(self, ind, reset_vary=False):
+        """Create all experimental coverage parameters for one Cf region.
+
+        ``reset_vary`` is intentionally False by default. Re-opening F3 or
+        rebuilding its widgets must never overwrite the user's vary/fixed
+        choices. Explicit model changes and automated model-comparison runs
+        may request a fresh active-parameter state with ``reset_vary=True``.
+        """
+        for name in self.coverage_parameter_names(ind):
+            if not hasattr(self, name):
+                self.add(name)
+        self.configure_coverage_parameters(ind, reset_vary=reset_vary)
+
+    def configure_coverage_parameters(self, ind=None, reset_vary=False):
+        """Synchronize coverage parameters with the selected model.
+
+        Inactive coverage parameters are already excluded by
+        :meth:`coverage_parameter_active`, so normal GUI refreshes do not need
+        to mutate ``vary``/``fit``. This avoids the old F3 bug where fixed Cf
+        or cova/covasys parameters silently became variable after closing and
+        reopening the fit-model window.
+        """
+        active_by_mode = {
+            'full': set(),
+            'ppc': {'cf'},
+            'powerlaw': {'cova'},
+            'powerlaw_ppc': {'cf', 'cova'},
+            'powerlaw_ppc_sysa': {'cf', 'covasys'},
+            'powerlaw_sysa_global': {'covasys'},
+            'powerlaw_radial': {'cova'},
+            'powerlaw_radial_ppc': {'cf', 'cova'},
+            'two_zone': {'cf', 'covr'},
+            'cfov': {'cov1', 'cov2', 'covov'},
+        }
+        active = active_by_mode[self.coverage_model()]
+        indices = range(self.cf_num) if ind is None else [ind]
+        for i in indices:
+            names = {
+                'cf': f'cf_{i}',
+                'cova': f'cova_{i}',
+                'covr': f'covr_{i}',
+                'cov1': f'cov1_{i}',
+                'cov2': f'cov2_{i}',
+                'covov': f'covov_{i}',
+            }
+            for key, name in names.items():
+                if hasattr(self, name) and reset_vary:
+                    par_ = getattr(self, name)
+                    par_.set(key in active, attr='vary')
+
+        self.ensure_system_powerlaw_parameters()
+        uses_system_a = 'covasys' in active
+        if reset_vary:
+            for system_id in range(len(self.sys)):
+                par_ = getattr(self, f'covasys_{system_id}')
+                par_.set(uses_system_a, attr='vary')
+
+    def remove_coverage_parameters(self, ind):
+        for name in self.coverage_parameter_names(ind):
+            if hasattr(self, name):
+                delattr(self, name)
 
     def add(self, name, addinfo=''):
         if name in 'mu':
@@ -460,8 +559,23 @@ class fitPars:
             self.cont.add(name)
         if name in 'hcont':
             self.hcont = par(self, 'hcont', 1, 0, 10, 0.1, vary=False)
-        if 'cf' in name:
+        if name == 'covmode':
+            self.covmode = par(self, 'covmode', 1, 0, 9, 1, vary=False, fit=False)
+        if name.startswith('cova_'):
+            setattr(self, name, par(self, name, 0.0, -2.0, 2.0, 0.05, vary=False))
+        if name.startswith('covasys_'):
+            setattr(self, name, par(self, name, 0.0, -2.0, 2.0, 0.05, vary=False))
+        if name.startswith('covr_'):
+            setattr(self, name, par(self, name, 0.1, 0.0, 1.0, 0.01, vary=False))
+        if name.startswith('cov1_') or name.startswith('cov2_'):
+            ind = int(name.split('_')[1])
+            initial = getattr(self, f'cf_{ind}').val if hasattr(self, f'cf_{ind}') else 0.5
+            setattr(self, name, par(self, name, initial, 0.0, 1.0, 0.01, vary=False))
+        if name.startswith('covov_'):
+            setattr(self, name, par(self, name, 1.0, 0.0, 1.0, 0.01, vary=False))
+        if name.startswith('cf_'):
             setattr(self, name, par(self, name, 0.1, 0, 1, 0.01, addinfo='all', left=3000, right=9000))
+            self.ensure_coverage_parameters(int(name.split('_')[1]))
         if 'zero' in name:
             setattr(self, name, par(self, name, 0.0, 0, 1, 0.01, addinfo='all'))
         if 'displ' in name:
@@ -479,7 +593,9 @@ class fitPars:
 
 
     def remove(self, name):
-        if name in ['mu', 'iso', 'hcont'] or any([x in name for x in ['me', 'res', 'cf', 'zero', 'disp', 'sts', 'stNu', 'stNl']]):
+        if name.startswith('cf_'):
+            self.remove_coverage_parameters(int(name.split('_')[1]))
+        if name in ['mu', 'iso', 'hcont', 'covmode'] or name.startswith('cov') or any([x in name for x in ['me', 'res', 'cf', 'zero', 'disp', 'sts', 'stNu', 'stNl']]):
             if hasattr(self, name):
                 delattr(self, name)
         if 'cont_' in name:
@@ -487,14 +603,42 @@ class fitPars:
                 #gc.collect()
 
     def addTieds(self, p1, p2):
+        """Tie ``p1`` to ``p2`` while remembering p1's prior fit state."""
         try:
-            self.getPar(p1)
+            par1 = self.getPar(p1)
             self.getPar(p2)
-            if not (p1 in self.tieds.keys() and self.tieds[p1] == p2):
-                self.tieds[p1] = p2
-                self.setValue(p1, False, 'vary')
-        except:
+            if p1 not in self._tie_saved_states:
+                self._tie_saved_states[p1] = (bool(par1.vary), bool(par1.fit))
+            self.tieds[p1] = p2
+            par1.set(False, attr='vary')
+        except Exception:
             pass
+
+    def replaceTieds(self, ties):
+        """Replace the complete tie map and restore parameters that were untied.
+
+        Older code cleared ``self.tieds`` but left the source parameter with
+        ``vary=False`` and, importantly, ``fit=False``. The F3 checkbox could
+        then look enabled while the parameter was absent from lmfit.
+        """
+        ties = dict(ties)
+        old_sources = set(self.tieds)
+        new_sources = set(ties)
+        for p1 in old_sources - new_sources:
+            try:
+                par1 = self.getPar(p1)
+                vary, fit = self._tie_saved_states.pop(p1, (True, True))
+                par1.vary = bool(vary)
+                par1.fit = bool(fit)
+            except Exception:
+                self._tie_saved_states.pop(p1, None)
+
+        self.tieds = {}
+        for p1, p2 in ties.items():
+            self.addTieds(p1, p2)
+
+    def clearTieds(self):
+        self.replaceTieds({})
 
     def addSys(self, ind=-1, z=None):
         if z is None:
@@ -506,6 +650,9 @@ class fitPars:
         else:
             self.sys.append(fitSystem(self, z))
         self.refreshSys()
+        if self.cf_fit:
+            self.ensure_system_powerlaw_parameters()
+            self.configure_coverage_parameters()
 
     def delSys(self, ind=-1):
 
@@ -521,23 +668,48 @@ class fitPars:
 
         gc.collect()
         self.refreshSys()
+        stale = f'covasys_{len(self.sys)}'
+        if hasattr(self, stale):
+            delattr(self, stale)
+        if self.cf_fit:
+            self.ensure_system_powerlaw_parameters()
+            self.configure_coverage_parameters()
 
     def swapSys(self, i1, i2):
         if self.cf_fit:
             for i in range(self.cf_num):
                 if hasattr(self, 'cf_' + str(i)):
                     p = getattr(self, 'cf_' + str(i))
-                    cf = p.addinfo.split('_')
-                    print('cf', cf)
-                    if cf[0].find('sys') > -1:
-                        if i1 in [int(s) for s in cf[0].split('sys')[1:]]:
-                            self.setValue('cf_' + str(i), 'sys'+'sys'.join([s if int(s) != i1 else str(i2) for s in cf[0].split('sys')[1:]]) + '_' + cf[1], 'addinfo')
-                        if i2 in [int(s) for s in cf[0].split('sys')[1:]]:
-                            self.setValue('cf_' + str(i), 'sys'+'sys'.join([s if int(s) != i2 else str(i1) for s in cf[0].split('sys')[1:]]) + '_' + cf[1], 'addinfo')
-                        #if int(p.addinfo[p.addinfo.find('sys')+3:p.addinfo.find('_')]) == i1:
-                        #    p.addinfo = p.addinfo[:p.addinfo.find('sys')+3]+str(i2)+p.addinfo[p.addinfo.find('_'):]
-                        #elif int(p.addinfo[p.addinfo.find('sys')+3:p.addinfo.find('_')]) == i2:
-                        #    p.addinfo = p.addinfo[:p.addinfo.find('sys')+3]+str(i1)+p.addinfo[p.addinfo.find('_'):]
+                    systems, exposure = parse_coverage_assignment(p.addinfo)
+                    if systems is not None:
+                        swapped = []
+                        for system_id in systems:
+                            if system_id == i1:
+                                system_id = i2
+                            elif system_id == i2:
+                                system_id = i1
+                            swapped.append(system_id)
+                        self.setValue(
+                            'cf_' + str(i),
+                            format_coverage_assignment(swapped, exposure),
+                            'addinfo',
+                        )
+        if self.coverage_model() == 'cfov' and {i1, i2} == {0, 1}:
+            for i in range(self.cf_num):
+                n1, n2 = f'cov1_{i}', f'cov2_{i}'
+                if hasattr(self, n1) and hasattr(self, n2):
+                    p1, p2 = getattr(self, n1), getattr(self, n2)
+                    for attr in ['val', 'min', 'max', 'step', 'vary', 'fit']:
+                        v1, v2 = getattr(p1, attr), getattr(p2, attr)
+                        setattr(p1, attr, v2)
+                        setattr(p2, attr, v1)
+        n1, n2 = f'covasys_{i1}', f'covasys_{i2}'
+        if hasattr(self, n1) and hasattr(self, n2):
+            p1, p2 = getattr(self, n1), getattr(self, n2)
+            for attr in ['val', 'min', 'max', 'step', 'vary', 'fit']:
+                v1, v2 = getattr(p1, attr), getattr(p2, attr)
+                setattr(p1, attr, v2)
+                setattr(p2, attr, v1)
         self.sys[i1], self.sys[i2] = self.sys[i2], self.sys[i1]
         self.refreshSys()
 
@@ -562,10 +734,15 @@ class fitPars:
                 self.add('iso', addinfo='D/H')
             res = getattr(self, 'iso').set(val, attr, check=check)
 
-        if s[0] in ['me', 'res', 'cf', 'zero', 'displ', 'disps', 'dispz', 'hcont', 'sts', 'stNl', 'stNu']:
+        if s[0] in ['me', 'res', 'cf', 'zero', 'displ', 'disps', 'dispz', 'hcont', 'sts', 'stNl', 'stNu',
+                    'covmode', 'cova', 'covasys', 'covr', 'cov1', 'cov2', 'covov']:
             if not hasattr(self, name):
                 self.add(name)
             res = getattr(self, name).set(val, attr, check=check)
+            if s[0] == 'covmode':
+                self.covmode.val = coverage_mode_index(self.covmode.val)
+                self.covmode.vary = False
+                self.covmode.fit = False
 
         if s[0] in ['cont']:
             if not hasattr(self, name):
@@ -649,7 +826,8 @@ class fitPars:
             if hasattr(self, s[0]):
                 par = getattr(self, s[0])
 
-        if s[0] in ['me', 'cont', 'res', 'cf', 'zero', 'displ', 'disps', 'dispz', 'sts', 'stNl', 'stNu']:
+        if s[0] in ['me', 'cont', 'res', 'cf', 'zero', 'displ', 'disps', 'dispz', 'sts', 'stNl', 'stNu',
+                    'covmode', 'cova', 'covasys', 'covr', 'cov1', 'cov2', 'covov']:
             if hasattr(self, name):
                 par = getattr(self, name)
 
@@ -680,8 +858,27 @@ class fitPars:
         for par in self.list():
             par.check()
 
+    def coverage_parameter_active(self, name):
+        prefix = name.split('_')[0]
+        active_by_mode = {
+            'full': set(),
+            'ppc': {'cf'},
+            'powerlaw': {'cova'},
+            'powerlaw_ppc': {'cf', 'cova'},
+            'powerlaw_ppc_sysa': {'cf', 'covasys'},
+            'powerlaw_sysa_global': {'covasys'},
+            'powerlaw_radial': {'cova'},
+            'powerlaw_radial_ppc': {'cf', 'cova'},
+            'two_zone': {'cf', 'covr'},
+            'cfov': {'cov1', 'cov2', 'covov'},
+        }
+        if prefix not in {'cf', 'cova', 'covasys', 'covr', 'cov1', 'cov2', 'covov'}:
+            return True
+        return prefix in active_by_mode[self.coverage_model()]
+
     def list_fit(self):
-        return [par for par in self.list() if par.fit & par.vary]
+        return [par for par in self.list()
+                if par.fit & par.vary & self.coverage_parameter_active(str(par))]
 
     def list_vary(self):
         return [par for par in self.list() if par.vary]
@@ -700,6 +897,7 @@ class fitPars:
     def pars(self, ind=None):
         pars = OrderedDict()
         if ind in [None, -1]:
+            pars[str(self.covmode)] = self.covmode
             for attr in ['mu', 'iso', 'hcont', 'zero']:
                 if hasattr(self, attr):
                     p = getattr(self, attr)
@@ -725,7 +923,13 @@ class fitPars:
                         pars[str(p)] = p
             if self.cf_fit and self.cf_num > 0:
                 for i in range(self.cf_num):
-                    attr = 'cf_' + str(i)
+                    for attr in ['cf_' + str(i)] + self.coverage_parameter_names(i):
+                        if hasattr(self, attr):
+                            p = getattr(self, attr)
+                            pars[str(p)] = p
+                self.ensure_system_powerlaw_parameters()
+                for system_id in range(len(self.sys)):
+                    attr = f'covasys_{system_id}'
                     if hasattr(self, attr):
                         p = getattr(self, attr)
                         pars[str(p)] = p
@@ -791,10 +995,13 @@ class fitPars:
                 s[0] = 'me_0'
             self.me_num = max(self.me_num, int(s[0][3:]) + 1)
 
-        if 'cf' in s[0]:
+        if s[0].startswith('cf_'):
             self.cf_fit = True
             attrs = ['val', 'left', 'right', 'step', 'vary', 'addinfo']
             self.parent.plot.add_pcRegion()
+        if s[0] == 'covmode' or s[0].startswith(('cova_', 'covasys_', 'covr_', 'cov1_', 'cov2_', 'covov_')):
+            if not hasattr(self, s[0]):
+                self.add(s[0])
 
         if 'disp' in s[0]:
             self.disp_num = max(self.disp_num, int(s[0][6:]) + 1)
@@ -809,7 +1016,7 @@ class fitPars:
             if attr == 'addinfo' and 'cont_' in s[0]:
                 self.cont[int(s[0].split('_')[1])].fromInfo(val)
 
-        if 'cf' in s[0]:
+        if s[0].startswith('cf_'):
             self.parent.plot.pcRegions[-1].updateFromFit()
 
     def showLines(self, sp=None):
@@ -821,12 +1028,13 @@ class fitPars:
             self.parent.console.exec_command('add ' + ' '.join(sp))
         print('showLines finish')
 
-    def fromLMfit(self, result):
+    def fromLMfit(self, result, quiet=False):
         for p in result.params.keys():
             par = result.params[p]
             name = str(par.name).replace('l4', '****').replace('l3', '***').replace('l2', '**').replace('l1', '*')
             self.setValue(name, self.pars()[name].ref(par.value), 'val')
-            print(p, par.stderr)
+            if not quiet:
+                print(p, par.stderr)
             if isinstance(self.pars()[name].ref(par.stderr, attr='unc'), float):
                 self.setValue(name, self.pars()[name].ref(par.stderr, attr='unc'), 'unc')
                 self.setValue(name, self.pars()[name].ref(par.stderr, attr='unc'), 'step')
@@ -911,16 +1119,10 @@ class spec:
                         l.recalc = True
                         l.sys = sys.ind
                         l.range = tau(l, resolution=self.resolution()).getrange(tlim=tlim)
-                        l.cf = -1
-                        if self.parent.fit.cf_fit:
-                            for i in range(self.parent.fit.cf_num):
-                                cf = getattr(self.parent.fit, 'cf_' + str(i))
-                                cf_sys = cf.addinfo.split('_')[0]
-                                cf_exp = cf.addinfo.split('_')[1] if len(cf.addinfo.split('_')) > 1 else 'all'
-                                if (cf_sys == 'all' or sys.ind == int(cf_sys[3:])) and (
-                                                cf_exp == 'all' or self.ind() == int(cf_exp[3:])) and l.l() * (
-                                            1 + l.z) > cf.min and l.l() * (1 + l.z) < cf.max:
-                                    l.cf = i
+                        region = coverage_region_for_line(
+                            self.parent.fit, l, exposure_index=self.ind()
+                        )
+                        l.cf = -1 if region is None else region
                         if all:
                             if any([x[0] < p < x[-1] for p in l.range]):
                                 self.fit_lines += [l]

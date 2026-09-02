@@ -723,7 +723,8 @@ class pcRegion():
             self.parent.parent.fit.cf_fit = True
         try:
             self.parent.parent.fitModel.cf.setExpanded(self.parent.parent.fit.cf_fit)
-            self.parent.parent.fitModel.addChild('cf', 'cf_' + str(ind))
+            self.parent.parent.fitModel.addChild('cf', 'cf_' + str(ind), text_val='Cf / high-zone fraction ' + str(ind))
+            self.parent.parent.fitModel.addCoverageChildren(ind)
         except:
             pass
         self.parent.parent.fit.cf_num += 1
@@ -776,8 +777,18 @@ class pcRegion():
         if self.ind < len(self.parent.pcRegions):
             for i in range(self.ind, len(self.parent.pcRegions)):
                 self.parent.pcRegions[i].setInd(i)
-                cf = getattr(self.parent.parent.fit, 'cf_' + str(i + 1))
-                setattr(self.parent.parent.fit, 'cf_' + str(i), par(self, 'cf_' + str(i), cf.val, 0, 1, cf.step, left=cf.left, right=cf.right, addinfo=cf.addinfo))
+                fit = self.parent.parent.fit
+                cf = getattr(fit, 'cf_' + str(i + 1))
+                setattr(fit, 'cf_' + str(i), par(fit, 'cf_' + str(i), cf.val, 0, 1, cf.step,
+                                                   left=cf.left, right=cf.right, addinfo=cf.addinfo,
+                                                   vary=cf.vary, fit=cf.fit))
+                for prefix in ['cova', 'covr', 'cov1', 'cov2', 'covov']:
+                    source_name, target_name = f'{prefix}_{i + 1}', f'{prefix}_{i}'
+                    if hasattr(fit, source_name):
+                        source = getattr(fit, source_name)
+                        setattr(fit, target_name,
+                                par(fit, target_name, source.val, source.min, source.max, source.step,
+                                    addinfo=source.addinfo, vary=source.vary, fit=source.fit))
                 self.parent.pcRegions[i].redraw()
 
         self.parent.parent.fit.remove('cf_' + str(len(self.parent.pcRegions)))
